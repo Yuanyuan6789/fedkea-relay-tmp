@@ -1,0 +1,158 @@
+name: fedkea-relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      record_file:
+        description: 'Zenodo file URL'
+        required: true
+        default: 'https://zenodo.org/records/14868763/files/model_param.tar.gz'
+      tag:
+        description: 'Release tag'
+        required: true
+        default: 'fedkea-model-params'
+      part_size_mb:
+        description: 'Chunk size in MB (must be < 2048)'
+        required: true
+        default: '1800'
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    outputs:
+      total: ${{ steps.p.outputs.total }}
+      chunk: ${{ steps.p.outputs.chunk }}
+      count: ${{ steps.p.outputs.count }}
+      parts: ${{ steps.p.outputs.parts }}
+    steps:
+      - name: Probe Zenodo availability and size
+        id: p
+        env:
+          URL: ${{ inputs.record_file }}
+          PART_MB: ${{ inputs.part_size_mb }}
+        run: |
+          set -euo pipefail
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+          hdr=$(curl -sIL --max-time 60 -A "$UA" "$URL")
+          code=$(printf '%s\n' "$hdr" | awk '/^HTTP\//{c=$2} END{print c}')
+          total=$(printf '%s\n' "$hdr" | awk 'BEGIN{IGNORECASE=1} /^content-length:/{gsub(/\r/,"",$2); v=$2} END{print v}')
+          echo "probe: status=$code total=$total"
+          if [ "$code" != "200" ]; then
+            echo "::error::Zenodo probe failed: HTTP $code (Azure runner 出口同样被风控)"
+            printf '%s\n' "$hdr" | tail -20
+            exit 1
+          fi
+          if [ -z "${total:-}" ] || [ "$total" -le 0 ]; then
+            echo "::error::content-length missing"
+            exit 1
+          fi
+          chunk=$(( PART_MB * 1024 * 1024 ))
+          count=$(( (total + chunk - 1) / chunk ))
+          parts=$(python3 -c "import json,sys;print(json.dumps(list(range(int(sys.argv[1])))))" "$count")
+          echo "chunk=$chunk count=$count parts=$parts"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "chunk=$chunk" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "parts=$parts" >> "$GITHUB_OUTPUT"
+
+  setup:
+    needs: probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release and manifest
+        env:
+          TAG: ${{ inputs.tag }}
+          URL: ${{ inputs.record_file }}
+          TOTAL: ${{ needs.probe.outputs.total }}
+          CHUNK: ${{ needs.probe.outputs.chunk }}
+          COUNT: ${{ needs.probe.outputs.count }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "FEDKEA model params relay" \
+              --notes "Temporary relay of $URL"
+          fi
+          python3 - <<'PY' > manifest.json
+          import json, os
+          print(json.dumps({
+              "source": os.environ["URL"],
+              "filename": "model_param.tar.gz",
+              "total_size": int(os.environ["TOTAL"]),
+              "chunk": int(os.environ["CHUNK"]),
+              "count": int(os.environ["COUNT"]),
+          }, indent=2))
+          PY
+          cat manifest.json
+          gh release upload "$TAG" manifest.json --clobber
+
+  fetch:
+    needs: [probe, setup]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        part: ${{ fromJSON(needs.probe.outputs.parts) }}
+    steps:
+      - name: Download range and upload asset
+        env:
+          TAG: ${{ inputs.tag }}
+          URL: ${{ inputs.record_file }}
+          TOTAL: ${{ needs.probe.outputs.total }}
+          CHUNK: ${{ needs.probe.outputs.chunk }}
+          PART: ${{ matrix.part }}
+        run: |
+          set -euo pipefail
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+          start=$(( PART * CHUNK ))
+          end=$(( start + CHUNK - 1 ))
+          if [ "$end" -ge "$TOTAL" ]; then end=$(( TOTAL - 1 )); fi
+          want=$(( end - start + 1 ))
+          f="part.${PART}"
+          echo "part=$PART range=${start}-${end} want=${want}"
+          ok=0
+          for attempt in 1 2 3; do
+            rm -f "$f"
+            if curl -fL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 3600 \
+                    -A "$UA" -r "${start}-${end}" -o "$f" "$URL"; then
+              got=$(stat -c%s "$f" 2>/dev/null || echo 0)
+              echo "attempt=$attempt got=$got want=$want"
+              if [ "$got" = "$want" ]; then ok=1; break; fi
+            else
+              echo "attempt=$attempt curl failed"
+            fi
+            sleep 15
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::part $PART size mismatch (server may ignore Range)"
+            exit 1
+          fi
+          sha256sum "$f" > "${f}.sha256"
+          cat "${f}.sha256"
+          gh release upload "$TAG" "$f" "${f}.sha256" --clobber
+
+  finish:
+    needs: [probe, setup, fetch]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify asset count
+        env:
+          TAG: ${{ inputs.tag }}
+          COUNT: ${{ needs.probe.outputs.count }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json assets --jq '.assets[].name' | sort
+          n=$(gh release view "$TAG" --json assets \
+              --jq '[.assets[] | select(.name | startswith("part.")) | select(.name | endswith(".sha256") | not)] | length')
+          echo "parts_uploaded=$n expected=$COUNT"
+          if [ "$n" != "$COUNT" ]; then
+            echo "::error::asset count mismatch"
+            exit 1
+          fi
+          echo "RELAY-READY repo=${{ github.repository }} tag=$TAG"
